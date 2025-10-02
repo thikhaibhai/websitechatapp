@@ -1,19 +1,19 @@
 import os
 import json
 import glob
+import shutil
 import faiss
-import requests
+import numpy as np
+import streamlit as st
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from dotenv import load_dotenv
-from unstructured.partition.html import partition_html
-from unstructured.staging.base import elements_to_json
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-import streamlit as st
 from google import genai
-import shutil
+from playwright.sync_api import sync_playwright
+import trafilatura
 
 
 # ================================
@@ -23,22 +23,35 @@ RESULTS_DIR = "results"
 CHUNKS_DIR = "chunks"
 INDEX_DIR = "faiss_index"
 
-for folder in [RESULTS_DIR, CHUNKS_DIR, INDEX_DIR]:
-    os.makedirs(folder, exist_ok=True)
+
+# ================================
+# CLEANUP FUNCTION
+# ================================
+def clear_old_data():
+    """Delete old results, chunks, and FAISS index before new website run."""
+    for d in [RESULTS_DIR, CHUNKS_DIR, INDEX_DIR]:
+        if os.path.exists(d):
+            shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
 
 
 # ================================
-# RESET FUNCTION
+# PLAYWRIGHT FETCHER
 # ================================
-def reset_pipeline():
-    """Delete all results, chunks, and index data."""
-    for folder in [RESULTS_DIR, CHUNKS_DIR, INDEX_DIR]:
-        shutil.rmtree(folder, ignore_errors=True)
-        os.makedirs(folder, exist_ok=True)
+def fetch_page_with_playwright(url, timeout=15000):
+    """Fetch fully rendered HTML using Playwright headless browser."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_default_timeout(timeout)
+        page.goto(url)
+        content = page.content()
+        browser.close()
+    return content
 
 
 # ================================
-# HELPER FUNCTIONS
+# HELPERS
 # ================================
 def get_resource_type(url):
     if url.endswith('.pdf'): return 'pdf'
@@ -59,16 +72,16 @@ def crawl_website(start_url, max_depth):
     urls_to_visit = [(start_url, 0)]
     visited_urls = set()
     crawled_resources = []
-    
+
     while urls_to_visit:
         current_url, current_depth = urls_to_visit.pop(0)
+
         if current_url in visited_urls or current_depth > max_depth:
             continue
+
         try:
             visited_urls.add(current_url)
-            headers = {'User-Agent': 'MyProjectCrawler/1.0'}
-            response = requests.get(current_url, timeout=10, headers=headers)
-            response.raise_for_status()
+            html_content = fetch_page_with_playwright(current_url)
 
             resource_info = {
                 'source_url': current_url,
@@ -78,7 +91,7 @@ def crawl_website(start_url, max_depth):
             crawled_resources.append(resource_info)
 
             if resource_info['type'] == 'html' and current_depth < max_depth:
-                soup = BeautifulSoup(response.content, 'html.parser')
+                soup = BeautifulSoup(html_content, 'html.parser')
                 for link_tag in soup.find_all('a', href=True):
                     href = link_tag['href']
                     absolute_url = urljoin(current_url, href)
@@ -87,34 +100,31 @@ def crawl_website(start_url, max_depth):
                             if absolute_url not in visited_urls:
                                 urls_to_visit.append((absolute_url, current_depth + 1))
 
-        except Exception:
-            continue
+        except Exception as e:
+            st.warning(f"Error crawling {current_url}: {e}")
+
     return crawled_resources
 
 
 # ================================
-# STEP 2: Process with Unstructured
+# STEP 2: Extract Text (Trafilatura)
 # ================================
-def process_with_unstructured(resources, results_dir=RESULTS_DIR):
+def process_with_trafilatura(resources, results_dir=RESULTS_DIR):
+    os.makedirs(results_dir, exist_ok=True)
     for i, res in enumerate(resources, 1):
         if res['type'] != 'html':
             continue
         url = res['source_url']
         try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            html_content = response.text
-            tmp_file = os.path.join(results_dir, f"page_{i}.html")
-
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                f.write(html_content)
-
-            elements = partition_html(filename=tmp_file)
-            output_file = os.path.join(results_dir, f"page_{i}-output.json")
-            elements_to_json(elements=elements, filename=output_file)
-            os.remove(tmp_file)
-        except Exception:
-            continue
+            html_content = fetch_page_with_playwright(url)
+            extracted_text = trafilatura.extract(html_content, include_tables=True)
+            if not extracted_text:
+                continue
+            output_file = os.path.join(results_dir, f"page_{i}-output.txt")
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(extracted_text)
+        except Exception as e:
+            st.warning(f"Error processing {url}: {e}")
 
 
 # ================================
@@ -123,16 +133,14 @@ def process_with_unstructured(resources, results_dir=RESULTS_DIR):
 def load_documents(results_dir=RESULTS_DIR):
     docs = []
     for file in os.listdir(results_dir):
-        if file.endswith("-output.json"):
+        if file.endswith("-output.txt"):
             with open(os.path.join(results_dir, file), "r", encoding="utf-8") as f:
-                elements = json.load(f)
-                for e in elements:
-                    text = e.get("text")
-                    if text and text.strip():
-                        docs.append({"text": text.strip(), "source": file})
+                text = f.read()
+                if text.strip():
+                    docs.append({"text": text.strip(), "source": file})
     return docs
 
-def chunk_documents(docs, chunk_size=500, chunk_overlap=50):
+def chunk_documents(docs, chunk_size=500, chunk_overlap=200):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -145,6 +153,7 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=50):
     return chunks
 
 def save_chunks(chunks, chunks_dir=CHUNKS_DIR):
+    os.makedirs(chunks_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(chunks_dir, f"chunks_{timestamp}.json")
     with open(output_file, "w", encoding="utf-8") as f:
@@ -155,59 +164,55 @@ def save_chunks(chunks, chunks_dir=CHUNKS_DIR):
 # ================================
 # STEP 4: Embedding + FAISS Index
 # ================================
+def load_latest_chunks(chunks_dir=CHUNKS_DIR):
+    files = glob.glob(os.path.join(chunks_dir, "chunks_*.json"))
+    if not files:
+        raise FileNotFoundError("No chunk files found.")
+    latest_file = max(files, key=os.path.getctime)
+    with open(latest_file, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    return chunks, latest_file
+
 def embed_chunks(chunks, model_name="all-MiniLM-L6-v2", device="cpu"):
     model = SentenceTransformer(model_name, device=device)
     texts = [c["text"] for c in chunks]
-    embeddings = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
     return embeddings
 
 def save_faiss_index(embeddings, chunks, index_dir=INDEX_DIR):
+    os.makedirs(index_dir, exist_ok=True)
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
-    index.add(embeddings.astype("float32"))
-    index_file = os.path.join(index_dir, "faiss_index.bin")
-    meta_file = os.path.join(index_dir, "metadata.json")
-    faiss.write_index(index, index_file)
-    with open(meta_file, "w", encoding="utf-8") as f:
+    index.add(embeddings)
+    faiss.write_index(index, os.path.join(index_dir, "faiss_index.bin"))
+    with open(os.path.join(index_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(chunks, f, indent=4, ensure_ascii=False)
-
-def load_faiss_index(model_name="all-MiniLM-L6-v2", device="cpu"):
-    index_file = os.path.join(INDEX_DIR, "faiss_index.bin")
-    meta_file = os.path.join(INDEX_DIR, "metadata.json")
-    if not os.path.exists(index_file) or not os.path.exists(meta_file):
-        return None, None, None
-    index = faiss.read_index(index_file)
-    with open(meta_file, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-    model = SentenceTransformer(model_name, device=device)
-    return index, metadata, model
 
 
 # ================================
 # STEP 5: Retrieval + Gemini
 # ================================
+def load_faiss_index(model_name="all-MiniLM-L6-v2", device="cpu"):
+    index = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
+    with open(os.path.join(INDEX_DIR, "metadata.json"), "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    model = SentenceTransformer(model_name, device=device)
+    return index, metadata, model
+
 def retrieve(query, top_k=3):
     index, metadata, model = load_faiss_index()
-    if not index:
-        return []
     query_vec = model.encode([query], convert_to_numpy=True)
     distances, indices = index.search(query_vec, top_k)
-    results = []
-    for i in range(len(indices[0])):
-        idx = indices[0][i]
-        results.append(metadata[idx]["text"])
-    return results
+    return [metadata[idx]["text"] for idx in indices[0]]
 
-def ask_gemini(query):
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
+def ask_gemini(query, api_key):
     if not api_key:
-        return "❌ GEMINI_API_KEY missing in .env"
+        raise ValueError("❌ No API key provided. Set it in secrets or sidebar.")
     client = genai.Client(api_key=api_key)
     context_chunks = retrieve(query, top_k=3)
     context = "\n".join(context_chunks)
     prompt = f"""
-    Use the following context to answer:
+    You are a helpful assistant. Use the following context to answer:
 
     Context:
     {context}
@@ -227,43 +232,55 @@ def ask_gemini(query):
 # ================================
 # STREAMLIT APP
 # ================================
-st.set_page_config(page_title="Web Crawler + RAG Bot", layout="wide")
-st.title("🌐 Web Crawler + RAG Chatbot (Gemini + FAISS)")
+st.set_page_config(page_title="Website QA Bot", layout="wide")
+st.title("🌐 Website QA Bot (Trafilatura + FAISS + Gemini)")
 
-# Sidebar
-st.sidebar.header("⚙️ Settings")
-url_input = st.sidebar.text_input("Website URL")
-depth_input = st.sidebar.number_input("Crawl Depth", min_value=0, max_value=5, value=1, step=1)
+# 🔑 API Key Handling
+api_key = None
+if "GEMINI_API_KEY" in st.secrets:   # ✅ Streamlit Cloud
+    api_key = st.secrets["GEMINI_API_KEY"]
+else:
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")  # ✅ Local dev
+    if not api_key:
+        api_key = st.sidebar.text_input("Enter GEMINI_API_KEY:", type="password")  # ✅ Fallback
 
-if st.sidebar.button("🚀 Run Pipeline"):
-    if url_input:
-        with st.spinner("Crawling website..."):
-            resources = crawl_website(url_input, depth_input)
-            with open("crawled_resources.json", "w", encoding="utf-8") as f:
-                json.dump(resources, f, indent=4, ensure_ascii=False)
-        with st.spinner("Processing with Unstructured..."):
-            process_with_unstructured(resources)
-        with st.spinner("Loading + chunking docs..."):
-            docs = load_documents()
-            chunks = chunk_documents(docs)
-            save_chunks(chunks)
-        with st.spinner("Embedding + Building FAISS index..."):
-            if chunks:
-                device = "cuda" if SentenceTransformer("all-MiniLM-L6-v2")._target_device.type == "cuda" else "cpu"
-                embeddings = embed_chunks(chunks, device=device)
-                save_faiss_index(embeddings, chunks)
-        st.success("✅ Pipeline completed! You can now ask questions.")
 
-# Clear old data
-if st.sidebar.button("🗑 Clear Data"):
-    reset_pipeline()
-    st.sidebar.success("All data cleared. Ready for a new session!")
+# Crawl form
+with st.form("crawl_form"):
+    url = st.text_input("Enter website URL:")
+    depth = st.number_input("Max crawl depth", min_value=0, max_value=3, value=0)
+    submitted = st.form_submit_button("Process Website")
 
-# Chatbot section
-st.subheader("🤖 Ask Questions")
-user_query = st.text_input("Type your question here:")
-if st.button("Ask"):
-    if user_query.strip():
-        with st.spinner("Thinking..."):
-            answer = ask_gemini(user_query)
-        st.markdown(f"**Answer:** {answer}")
+if submitted and url:
+    clear_old_data()
+    st.info("Crawling website... please wait ⏳")
+    resources = crawl_website(url, depth)
+    st.success(f"Crawled {len(resources)} pages")
+
+    st.info("Extracting text...")
+    process_with_trafilatura(resources)
+
+    st.info("Chunking text...")
+    docs = load_documents()
+    chunks = chunk_documents(docs)
+    save_chunks(chunks)
+    st.success(f"Created {len(chunks)} chunks")
+
+    st.info("Generating embeddings...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    device = "cuda" if str(model.device) == "cuda" else "cpu"
+    embeddings = embed_chunks(chunks, device=device)
+    save_faiss_index(embeddings, chunks)
+    st.success("FAISS index ready ✅")
+
+# Chat UI
+if os.path.exists(os.path.join(INDEX_DIR, "faiss_index.bin")):
+    st.subheader("💬 Ask Questions")
+    query = st.text_input("Your question:")
+    if st.button("Ask") and query:
+        try:
+            answer = ask_gemini(query, api_key)
+            st.markdown(f"**🤖 Answer:** {answer}")
+        except Exception as e:
+            st.error(f"Error: {e}")
