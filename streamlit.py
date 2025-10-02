@@ -13,26 +13,33 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import streamlit as st
 from google import genai
+import shutil
+
+
+# ================================
+# CONFIG
+# ================================
+RESULTS_DIR = "results"
+CHUNKS_DIR = "chunks"
+INDEX_DIR = "faiss_index"
+
+for folder in [RESULTS_DIR, CHUNKS_DIR, INDEX_DIR]:
+    os.makedirs(folder, exist_ok=True)
+
+
+# ================================
+# RESET FUNCTION
+# ================================
+def reset_pipeline():
+    """Delete all results, chunks, and index data."""
+    for folder in [RESULTS_DIR, CHUNKS_DIR, INDEX_DIR]:
+        shutil.rmtree(folder, ignore_errors=True)
+        os.makedirs(folder, exist_ok=True)
 
 
 # ================================
 # HELPER FUNCTIONS
 # ================================
-def get_domain(url: str) -> str:
-    """Extract domain (netloc) to use as folder name."""
-    return urlparse(url).netloc.replace("www.", "")
-
-def ensure_dirs(base_dir, domain):
-    """Ensure subfolders exist for a given domain."""
-    dirs = {
-        "results": os.path.join(base_dir, "results", domain),
-        "chunks": os.path.join(base_dir, "chunks", domain),
-        "index": os.path.join(base_dir, "faiss_index", domain),
-    }
-    for path in dirs.values():
-        os.makedirs(path, exist_ok=True)
-    return dirs
-
 def get_resource_type(url):
     if url.endswith('.pdf'): return 'pdf'
     if url.endswith('.docx'): return 'docx'
@@ -88,7 +95,7 @@ def crawl_website(start_url, max_depth):
 # ================================
 # STEP 2: Process with Unstructured
 # ================================
-def process_with_unstructured(resources, results_dir):
+def process_with_unstructured(resources, results_dir=RESULTS_DIR):
     for i, res in enumerate(resources, 1):
         if res['type'] != 'html':
             continue
@@ -113,7 +120,7 @@ def process_with_unstructured(resources, results_dir):
 # ================================
 # STEP 3: Load & Chunk Documents
 # ================================
-def load_documents(results_dir):
+def load_documents(results_dir=RESULTS_DIR):
     docs = []
     for file in os.listdir(results_dir):
         if file.endswith("-output.json"):
@@ -137,7 +144,7 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=50):
             chunks.append({"text": chunk, "source": d["source"]})
     return chunks
 
-def save_chunks(chunks, chunks_dir):
+def save_chunks(chunks, chunks_dir=CHUNKS_DIR):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(chunks_dir, f"chunks_{timestamp}.json")
     with open(output_file, "w", encoding="utf-8") as f:
@@ -154,7 +161,7 @@ def embed_chunks(chunks, model_name="all-MiniLM-L6-v2", device="cpu"):
     embeddings = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
     return embeddings
 
-def save_faiss_index(embeddings, chunks, index_dir):
+def save_faiss_index(embeddings, chunks, index_dir=INDEX_DIR):
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings.astype("float32"))
@@ -164,9 +171,9 @@ def save_faiss_index(embeddings, chunks, index_dir):
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(chunks, f, indent=4, ensure_ascii=False)
 
-def load_faiss_index(index_dir, model_name="all-MiniLM-L6-v2", device="cpu"):
-    index_file = os.path.join(index_dir, "faiss_index.bin")
-    meta_file = os.path.join(index_dir, "metadata.json")
+def load_faiss_index(model_name="all-MiniLM-L6-v2", device="cpu"):
+    index_file = os.path.join(INDEX_DIR, "faiss_index.bin")
+    meta_file = os.path.join(INDEX_DIR, "metadata.json")
     if not os.path.exists(index_file) or not os.path.exists(meta_file):
         return None, None, None
     index = faiss.read_index(index_file)
@@ -179,8 +186,8 @@ def load_faiss_index(index_dir, model_name="all-MiniLM-L6-v2", device="cpu"):
 # ================================
 # STEP 5: Retrieval + Gemini
 # ================================
-def retrieve(query, index_dir, top_k=3):
-    index, metadata, model = load_faiss_index(index_dir)
+def retrieve(query, top_k=3):
+    index, metadata, model = load_faiss_index()
     if not index:
         return []
     query_vec = model.encode([query], convert_to_numpy=True)
@@ -191,13 +198,13 @@ def retrieve(query, index_dir, top_k=3):
         results.append(metadata[idx]["text"])
     return results
 
-def ask_gemini(query, index_dir):
+def ask_gemini(query):
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "❌ GEMINI_API_KEY missing in .env"
     client = genai.Client(api_key=api_key)
-    context_chunks = retrieve(query, index_dir, top_k=3)
+    context_chunks = retrieve(query, top_k=3)
     context = "\n".join(context_chunks)
     prompt = f"""
     Use the following context to answer:
@@ -220,8 +227,8 @@ def ask_gemini(query, index_dir):
 # ================================
 # STREAMLIT APP
 # ================================
-st.set_page_config(page_title="Multi-Site RAG Bot", layout="wide")
-st.title("🌐 Multi-Website RAG Chatbot (Gemini + FAISS)")
+st.set_page_config(page_title="Web Crawler + RAG Bot", layout="wide")
+st.title("🌐 Web Crawler + RAG Chatbot (Gemini + FAISS)")
 
 # Sidebar
 st.sidebar.header("⚙️ Settings")
@@ -230,43 +237,33 @@ depth_input = st.sidebar.number_input("Crawl Depth", min_value=0, max_value=5, v
 
 if st.sidebar.button("🚀 Run Pipeline"):
     if url_input:
-        domain = get_domain(url_input)
-        dirs = ensure_dirs(".", domain)
-
-        with st.spinner(f"Crawling {domain}..."):
+        with st.spinner("Crawling website..."):
             resources = crawl_website(url_input, depth_input)
-            with open(os.path.join(dirs["results"], "crawled_resources.json"), "w", encoding="utf-8") as f:
+            with open("crawled_resources.json", "w", encoding="utf-8") as f:
                 json.dump(resources, f, indent=4, ensure_ascii=False)
-
         with st.spinner("Processing with Unstructured..."):
-            process_with_unstructured(resources, dirs["results"])
-
+            process_with_unstructured(resources)
         with st.spinner("Loading + chunking docs..."):
-            docs = load_documents(dirs["results"])
+            docs = load_documents()
             chunks = chunk_documents(docs)
-            save_chunks(chunks, dirs["chunks"])
-
+            save_chunks(chunks)
         with st.spinner("Embedding + Building FAISS index..."):
             if chunks:
                 device = "cuda" if SentenceTransformer("all-MiniLM-L6-v2")._target_device.type == "cuda" else "cpu"
                 embeddings = embed_chunks(chunks, device=device)
-                save_faiss_index(embeddings, chunks, dirs["index"])
+                save_faiss_index(embeddings, chunks)
+        st.success("✅ Pipeline completed! You can now ask questions.")
 
-        st.success(f"✅ Pipeline for {domain} completed! You can now ask questions.")
-
+# Clear old data
+if st.sidebar.button("🗑 Clear Data"):
+    reset_pipeline()
+    st.sidebar.success("All data cleared. Ready for a new session!")
 
 # Chatbot section
 st.subheader("🤖 Ask Questions")
-
-# Let user pick a domain they've processed
-base_folders = glob.glob("faiss_index/*")
-domains = [os.path.basename(d) for d in base_folders if os.path.isdir(d)]
-selected_domain = st.selectbox("Select a website index to query:", domains)
-
 user_query = st.text_input("Type your question here:")
-if st.button("Ask") and selected_domain:
+if st.button("Ask"):
     if user_query.strip():
         with st.spinner("Thinking..."):
-            index_dir = os.path.join("faiss_index", selected_domain)
-            answer = ask_gemini(user_query, index_dir)
+            answer = ask_gemini(user_query)
         st.markdown(f"**Answer:** {answer}")
