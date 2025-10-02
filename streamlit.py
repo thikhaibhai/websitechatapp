@@ -14,7 +14,15 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 from playwright.sync_api import sync_playwright
 import trafilatura
+import subprocess
 
+# Make sure Playwright browsers are installed
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    subprocess.run(["pip", "install", "playwright"], check=True)
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+    from playwright.sync_api import sync_playwright
 
 # ================================
 # CONFIG
@@ -284,3 +292,4 @@ if os.path.exists(os.path.join(INDEX_DIR, "faiss_index.bin")):
             st.markdown(f"**🤖 Answer:** {answer}")
         except Exception as e:
             st.error(f"Error: {e}")
+
