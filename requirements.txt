@@ -1,7 +1,7 @@
 streamlit
-requests
+playwright
 beautifulsoup4
-unstructured
+trafilatura
 langchain
 sentence-transformers
 faiss-cpu
