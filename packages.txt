@@ -1,4 +1,3 @@
-# system packages for Playwright + Chromium
 wget
 ca-certificates
 fonts-liberation
